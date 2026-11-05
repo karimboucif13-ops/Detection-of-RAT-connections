@@ -81,24 +81,23 @@ def ensure_admin():
 
 ensure_admin()
 
-APP_NAME = "RAT Guard Ultimate (XWorm Edition)"
+APP_NAME = "RAT Guard Ultimate v3"
 RULE_PREFIX = "RATGuardUlt-"
 
-# Common RAT & C2 Ports (XWorm, AsyncRAT, njRAT, DarkComet, Remcos, Venom)
+# These ports are clues only; no port is proof of malware by itself.
 RAT_KNOWN_PORTS = {
-    7000, 8000, 8888, 7777, 6666, 5552, 1604, 200, 2001, 2002, 
-    4899, 4444, 1337, 31337, 1234, 1235, 4321, 54321, 27015, 2710, 
+    7000, 8000, 8888, 7777, 6666, 5552, 1604, 200, 2001, 2002,
+    4899, 4444, 1337, 31337, 1234, 1235, 4321, 54321, 27015, 2710,
     5050, 8282, 3060, 3070, 4040
 }
 COMMON_PORTS = {53, 80, 123, 443, 853, 3389}
-
-# Typical execution paths for auto-dropped payloads like XWorm & njRAT
 SUSPICIOUS_PATHS = (
     "\\appdata\\roaming\\", "\\appdata\\local\\temp\\", "\\appdata\\local\\",
     "\\downloads\\", "\\desktop\\", "\\public\\", "\\programdata\\"
 )
-
 KNOWN_BROWSERS = ("chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "brave.exe", "discord.exe", "steam.exe")
+SPECIFIC_RAT_MARKERS = ("xworm", "wormexploit", "asyncrat", "njrat", "remcos", "darkcomet", "nanocore", "quasar", "warzone")
+GENERIC_SUSPICIOUS_MARKERS = ("worm", "payload", "stub")
 
 
 def run_cmd(args, timeout=15):
@@ -178,63 +177,112 @@ def is_public_ip(address):
         return False
 
 
-def analyze_rat_behavior(remote_ip, remote_port, state, path, name):
-    """Behavioral Analysis Engine specifically tailored for RATs like XWorm."""
-    if remote_ip in ("127.0.0.1", "::1", "*", "0.0.0.0", "::"):
-        return "🟢 اتصال محلي آمن", 0, "عادي"
-    if not is_public_ip(remote_ip):
-        return "🟢 شبكة محددة / خاصة", 0, "عادي"
+def suspicious_outbound_candidates(rows):
+    candidates = {}
+    for row in rows:
+        if row.get("level") != "danger" or row.get("score", 0) < 70:
+            continue
+        protocol = str(row.get("protocol", "")).upper()
+        state = str(row.get("state", "")).upper()
+        if protocol not in ("TCP", "UDP"):
+            continue
+        if state not in ("SYN_SENT", "ESTABLISHED", "UDP"):
+            continue
+        try:
+            remote_ip = str(ipaddress.ip_address(row.get("remote_ip", "").split("%", 1)[0]))
+            remote_port = int(row.get("remote_port"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not is_public_ip(remote_ip) or not 1 <= remote_port <= 65535:
+            continue
+        key = (protocol, remote_ip, remote_port)
+        candidates[key] = row
+    return list(candidates.items())
 
+
+def analyze_rat_behavior(remote_ip, remote_port, state, path, name, local_port="?", protocol="TCP", command=""):
+    """Heuristic triage only. It must never label an unscanned process as safe."""
     lower_path = (path or "").lower().replace("/", "\\")
     lower_name = (name or "").lower()
-    
-    try:
-        port = int(remote_port)
-    except (TypeError, ValueError):
-        port = -1
+    lower_command = (command or "").lower()
+    evidence_text = " ".join((lower_name, lower_path, lower_command))
+    state_upper = (state or "").upper()
+    protocol_upper = (protocol or "TCP").upper()
 
+    def as_port(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return -1
+
+    rport, lport = as_port(remote_port), as_port(local_port)
     score = 0
     reasons = []
 
-    # Check 1: Suspicious execution directories (XWorm default dropping locations)
+    # Process identity and path are checked even for localhost/private IPs.
+    specific_hits = [marker for marker in SPECIFIC_RAT_MARKERS if marker in evidence_text]
+    if specific_hits:
+        score += 65
+        reasons.append("اسم/مسار/سطر أوامر يحتوي مؤشراً معروفاً لعائلة RAT: " + ", ".join(specific_hits))
+    elif any(marker in evidence_text for marker in GENERIC_SUSPICIOUS_MARKERS):
+        score += 30
+        reasons.append("اسم أو مسار يحتوي كلمة تستحق الفحص (مثل worm/payload/stub)")
+
     if any(marker in lower_path for marker in SUSPICIOUS_PATHS):
-        score += 40
-        reasons.append("عملية تعمل من مسار مؤقت/قابلة للكتابة (AppData/Temp)")
+        score += 25
+        reasons.append("الملف يعمل من مجلد قابل للكتابة مثل AppData أو Temp أو Downloads")
 
-    # Check 2: Known C2 / RAT ports
-    if port in RAT_KNOWN_PORTS:
+    # Check both remote and local ports: netstat reports a listener's port locally.
+    ports_to_check = {p for p in (rport, lport) if 1 <= p <= 65535}
+    known_hits = sorted(ports_to_check.intersection(RAT_KNOWN_PORTS))
+    if known_hits:
         score += 45
-        reasons.append(f"منفذ اتصال شائع لبرمجيات C2/RAT ({port})")
+        reasons.append("منفذ شائع في بعض أدوات RAT/C2 (ليس دليلاً منفرداً): " + ", ".join(map(str, known_hits)))
 
-    # Check 3: Non-standard ports with established connection by non-browser apps
-    if port not in COMMON_PORTS and state == "ESTABLISHED":
-        if lower_name not in KNOWN_BROWSERS and not lower_path.startswith("c:\\windows\\"):
-            score += 30
-            reasons.append("اتصال خارجي مستمر بمنفذ غير عادي بدون متصفح")
+    # Classify address without treating localhost/private ranges as evidence of safety.
+    address_note = ""
+    try:
+        ip_obj = ipaddress.ip_address((remote_ip or "").split("%", 1)[0])
+        if ip_obj.is_loopback:
+            address_note = "الاتصال محلي (Loopback)؛ هذا لا يثبت أمان العملية"
+        elif ip_obj.is_private or ip_obj.is_link_local:
+            address_note = "الاتصال بعنوان خاص/محلي؛ هذا لا يثبت أمان العملية"
+        elif ip_obj.is_global and state_upper == "SYN_SENT":
+            score += 20
+            reasons.append("محاولة اتصال صادرة إلى IP عام لم تكتمل بعد (SYN_SENT)")
+        elif ip_obj.is_global and state_upper == "ESTABLISHED":
+            if rport not in COMMON_PORTS and lower_name not in KNOWN_BROWSERS and not lower_path.startswith("c:\\windows\\"):
+                score += 15
+                reasons.append("اتصال خارجي مستمر بمنفذ غير شائع لعملية ليست متصفحاً معروفاً")
+        elif not ip_obj.is_global:
+            address_note = "عنوان غير عام؛ لا يمكن استنتاج الأمان منه"
+    except ValueError:
+        address_note = "عنوان الوجهة غير محدد أو محلي؛ لا يمكن استنتاج الأمان منه"
 
-    # Check 4: Suspicious process naming patterns (e.g. random chars or spoofed names)
-    if lower_name.endswith(".exe") and lower_name not in KNOWN_BROWSERS:
-        if any(w in lower_name for w in ("stub", "worm", "rat", "client", "payload", "build")):
-            score += 50
-            reasons.append("اسم العملية يحتوي على دلالات برمجيات ضارة")
+    if state_upper == "LISTENING" and lport not in COMMON_PORTS:
+        reasons.append(f"البرنامج يستمع على منفذ محلي {lport}; تحقق من سبب فتحه")
+        score += 10
 
-    # Verdict Matrix
-    if score >= 60:
-        verdict = "🚨 خطر مرتفع جداً: مرجّح (XWorm / RAT) — افحصه فوراً!"
+    score = min(score, 100)
+    if score >= 70:
+        verdict = "🚨 مشتبه بقوة — اعزل العملية وافحص الملف"
         level = "danger"
-    elif score >= 30:
-        verdict = "⚠️ يستحق الفحص الدقيق (سلوك مريب)"
+    elif score >= 35:
+        verdict = "⚠️ مريب — يحتاج تحققاً إضافياً"
         level = "warning"
     else:
-        verdict = "🟢 اتصال خارجي عادي"
-        level = "normal"
+        verdict = "🟡 غير محسوم — لا توجد أدلة كافية للحكم بالأمان"
+        level = "uncertain"
 
-    details_str = " | ".join(reasons) if reasons else "لا توجد مؤشرات خطورة مجدية"
-    return verdict, score, details_str
+    if address_note:
+        reasons.append(address_note)
+    if not reasons:
+        reasons.append("لم تظهر مؤشرات ضمن القواعد الحالية؛ هذه ليست شهادة بأن الملف آمن")
+    return verdict, score, " | ".join(reasons), level
 
 
 def collect_connections():
-    result = run_cmd(["netstat.exe", "-ano", "-p", "tcp"], timeout=12)
+    result = run_cmd(["netstat.exe", "-ano"], timeout=15)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "تعذّر تشغيل netstat")
 
@@ -242,42 +290,53 @@ def collect_connections():
     pids = set()
     for line in result.stdout.splitlines():
         parts = line.split()
-        if len(parts) < 5 or parts[0].upper() != "TCP":
+        if len(parts) < 4 or parts[0].upper() not in ("TCP", "UDP"):
             continue
-        local, remote, state = parts[1], parts[2], parts[3]
+        protocol = parts[0].upper()
+        local, remote = parts[1], parts[2]
+        if protocol == "TCP":
+            if len(parts) < 5:
+                continue
+            state, pid_text = parts[3], parts[4]
+        else:
+            state, pid_text = "UDP", parts[3]
         try:
-            pid = int(parts[4])
+            pid = int(pid_text)
         except ValueError:
             continue
         local_ip, local_port = parse_endpoint(local)
         remote_ip, remote_port = parse_endpoint(remote)
         pids.add(pid)
-        parsed.append((local_ip, local_port, remote_ip, remote_port, state, pid))
+        parsed.append((protocol, local_ip, local_port, remote_ip, remote_port, state, pid))
 
     names = load_tasklist_names()
     details = load_process_details(pids)
     rows = []
-    for local_ip, local_port, remote_ip, remote_port, state, pid in parsed:
+    for protocol, local_ip, local_port, remote_ip, remote_port, state, pid in parsed:
         info = details.get(pid, {})
         name = names.get(pid, "غير معروف")
         path = info.get("ExecutablePath") or ""
-        verdict, score, reasons = analyze_rat_behavior(remote_ip, remote_port, state, path, name)
-        
+        command = info.get("CommandLine") or ""
+        verdict, score, reasons, level = analyze_rat_behavior(
+            remote_ip, remote_port, state, path, name, local_port, protocol, command
+        )
         rows.append({
+            "protocol": protocol,
             "local": f"{local_ip}:{local_port}",
             "remote": f"{remote_ip}:{remote_port}",
             "remote_ip": remote_ip,
             "remote_port": remote_port,
+            "local_port": local_port,
             "state": state,
             "pid": pid,
             "name": name,
             "path": path,
-            "command": info.get("CommandLine") or "",
+            "command": command,
             "verdict": verdict,
             "score": score,
-            "reasons": reasons
+            "reasons": reasons,
+            "level": level,
         })
-    # Sort highest risk scores to the top
     rows.sort(key=lambda x: (x["score"], x["name"].lower()), reverse=True)
     return rows
 
@@ -286,15 +345,26 @@ class RATGuardApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_NAME} — تحليل الـ RAT ومراقبة السلوك")
-        self.root.geometry("1320\\760".replace("\\", "x"))
-        self.root.minsize(1024, 600)
+        self.root.geometry("1480x900")
+        self.root.minsize(1120, 700)
         self.root.configure(bg="#0d1117")
         
         self.rows_by_id = {}
+        self.all_rows = []
         self.worker_busy = False
         self.events = queue.Queue()
         self.auto_refresh = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="جاهز — نظام التحليل السلوكي في الخدمة")
+        self.auto_block_suspicious = tk.BooleanVar(value=False)
+        self.auto_blocked_endpoints = set()
+        self.search_var = tk.StringVar()
+        self.filter_var = tk.StringVar(value="الكل")
+        self.status_var = tk.StringVar(value="جاهز — المراقبة السلوكية تعمل")
+        self.summary_vars = {
+            "total": tk.StringVar(value="0"),
+            "danger": tk.StringVar(value="0"),
+            "warning": tk.StringVar(value="0"),
+            "unknown": tk.StringVar(value="0"),
+        }
         
         self._build_ui()
         self.root.after(250, self._process_events)
@@ -307,74 +377,110 @@ class RATGuardApp:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        
-        style.configure("Treeview", rowheight=27, font=("Segoe UI", 9), background="#161b22", fieldbackground="#161b22", foreground="#c9d1d9")
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background="#21262d", foreground="#FFD700")
-        style.map("Treeview", background=[("selected", "#30363d")], foreground=[("selected", "#FFD700")])
+        style.configure("Treeview", rowheight=30, font=("Segoe UI", 9), background="#111827", fieldbackground="#111827", foreground="#e5e7eb", borderwidth=0)
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background="#1f2937", foreground="#93c5fd", padding=(8, 8))
+        style.map("Treeview", background=[("selected", "#1d4ed8")], foreground=[("selected", "#ffffff")])
+        style.configure("TCombobox", fieldbackground="#111827", background="#1f2937", foreground="#e5e7eb")
 
-        header = tk.Frame(self.root, bg="#0d1117", padx=16, pady=10)
+        header = tk.Frame(self.root, bg="#0b1220", padx=20, pady=16)
         header.pack(fill="x")
-        tk.Label(header, text="🛡️ RAT Guard Ultimate — خوارزمية كشف XWorm و برمجيات RAT", fg="#FFD700", bg="#0d1117", font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        tk.Label(
-            header,
-            text="تحليل سلوك الاتصالات والمنافذ ومسارات التشغيل للتمييز بين الاتصالات الآمنة والتي تستحق التدخل والقتل الفوري.",
-            fg="#8b949e", bg="#0d1117", font=("Segoe UI", 9)
-        ).pack(anchor="w", pady=(2, 0))
+        tk.Label(header, text="🛡️ RAT GUARD ULTIMATE", fg="#e5e7eb", bg="#0b1220", font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="مراقبة TCP / UDP • ربط الاتصالات بالعمليات • تقييم أولي لمؤشرات RAT", fg="#93c5fd", bg="#0b1220", font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 0))
+        tk.Label(header, text="تنبيه: (غير محسوم) لا تعني آمن. هذه أداة فرز سلوكي وليست مضاد فيروسات ولا تكشف كل RAT.", fg="#fbbf24", bg="#0b1220", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(7, 0))
 
-        toolbar = tk.Frame(self.root, bg="#161b22", padx=10, pady=7, highlightbackground="#30363d", highlightthickness=1)
-        toolbar.pack(fill="x", padx=14)
-        self._button(toolbar, "🔄 تحديث الاتصالات", self.refresh, color="#21262d", fg="#FFD700").pack(side="left", padx=3)
-        self._button(toolbar, "🛑 إنهاء العملية (Kill PID)", self.kill_selected_process, color="#5a0000").pack(side="left", padx=3)
-        self._button(toolbar, "🚫 حظر IP + Port", self.block_selected, color="#741212").pack(side="left", padx=3)
-        self._button(toolbar, "🔒 حظر البرنامج نهائياً", self.block_selected_program, color="#8b0000").pack(side="left", padx=3)
+        cards = tk.Frame(self.root, bg="#0d1117", padx=14, pady=10)
+        cards.pack(fill="x")
+        self._summary_card(cards, "كل الاتصالات", self.summary_vars["total"], "#93c5fd").pack(side="left", fill="x", expand=True, padx=4)
+        self._summary_card(cards, "اشتباه مرتفع", self.summary_vars["danger"], "#f87171").pack(side="left", fill="x", expand=True, padx=4)
+        self._summary_card(cards, "يحتاج تحقق", self.summary_vars["warning"], "#fbbf24").pack(side="left", fill="x", expand=True, padx=4)
+        self._summary_card(cards, "غير محسوم", self.summary_vars["unknown"], "#a5b4fc").pack(side="left", fill="x", expand=True, padx=4)
+
+        toolbar = tk.Frame(self.root, bg="#161b22", padx=10, pady=8, highlightbackground="#30363d", highlightthickness=1)
+        toolbar.pack(fill="x", padx=14, pady=(0, 5))
+        self._button(toolbar, "↻ تحديث", self.refresh, color="#1d4ed8").pack(side="left", padx=3)
+        self._button(toolbar, "إنهاء العملية", self.kill_selected_process, color="#7f1d1d").pack(side="left", padx=3)
+        self._button(toolbar, "حظر IP والمنفذ", self.block_selected, color="#991b1b").pack(side="left", padx=3)
+        self._button(toolbar, "حظر ملف البرنامج", self.block_selected_program, color="#7f1d1d").pack(side="left", padx=3)
+        self._button(toolbar, "حظر IP يدوي", self.block_custom_ip, color="#374151").pack(side="left", padx=3)
 
         toolbar2 = tk.Frame(self.root, bg="#161b22", padx=10, pady=7, highlightbackground="#30363d", highlightthickness=1)
-        toolbar2.pack(fill="x", padx=14, pady=(4, 0))
-        self._button(toolbar2, "🎯 حظر IP يدوي...", self.block_custom_ip, color="#21262d").pack(side="left", padx=3)
-        self._button(toolbar2, "🧹 تنظيف الحظر السلس", self.unblock_rule, color="#21262d").pack(side="left", padx=3)
-        self._button(toolbar2, "🔍 فحص Defender", self.scan_file, color="#21262d").pack(side="left", padx=3)
-        self._button(toolbar2, "🛡️ فحص التوقيع الرقمي", self.check_selected_file, color="#21262d").pack(side="left", padx=3)
-        
+        toolbar2.pack(fill="x", padx=14, pady=(0, 5))
+        self._button(toolbar2, "فحص Defender", self.scan_file, color="#374151").pack(side="left", padx=3)
+        self._button(toolbar2, "حالة Defender", self.check_defender_status, color="#374151").pack(side="left", padx=3)
+        self._button(toolbar2, "فحص توقيع/هاش الملف", self.check_selected_file, color="#374151").pack(side="left", padx=3)
+        self._button(toolbar2, "تصدير CSV", self.export_csv, color="#374151").pack(side="left", padx=3)
+        self._button(toolbar2, "إزالة قواعد RAT Guard", self.unblock_rule, color="#374151").pack(side="left", padx=3)
         tk.Checkbutton(
-            toolbar2, text="تحديث تلقائي (8 ثوانٍ)", variable=self.auto_refresh, 
-            fg="#c9d1d9", bg="#161b22", selectcolor="#21262d", 
-            activebackground="#161b22", activeforeground="#FFD700", font=("Segoe UI", 9)
+            toolbar2,
+            text="حظر تلقائي للمشبوه (IP:منفذ)",
+            variable=self.auto_block_suspicious,
+            command=self._toggle_auto_block,
+            fg="#fca5a5",
+            bg="#161b22",
+            selectcolor="#1f2937",
+            activebackground="#161b22",
+            activeforeground="#fca5a5",
+            font=("Segoe UI", 9, "bold"),
         ).pack(side="right", padx=6)
+        tk.Checkbutton(toolbar2, text="تحديث تلقائي كل 8 ثوانٍ", variable=self.auto_refresh, fg="#cbd5e1", bg="#161b22", selectcolor="#1f2937", activebackground="#161b22", activeforeground="#93c5fd", font=("Segoe UI", 9)).pack(side="right", padx=6)
 
-        columns = ("verdict", "name", "pid", "state", "remote", "local", "path")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", selectmode="browse")
+        filter_frame = tk.Frame(self.root, bg="#0d1117", padx=14, pady=6)
+        filter_frame.pack(fill="x")
+        tk.Label(filter_frame, text="بحث:", bg="#0d1117", fg="#cbd5e1", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 6))
+        search_entry = tk.Entry(filter_frame, textvariable=self.search_var, bg="#111827", fg="#e5e7eb", insertbackground="#ffffff", relief="flat", font=("Segoe UI", 10), width=34)
+        search_entry.pack(side="left", ipady=6, padx=(0, 12))
+        search_entry.insert(0, "")
+        tk.Label(filter_frame, text="عرض:", bg="#0d1117", fg="#cbd5e1", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 6))
+        filter_box = ttk.Combobox(filter_frame, textvariable=self.filter_var, state="readonly", width=20, values=("الكل", "اشتباه مرتفع", "يحتاج تحقق", "غير محسوم"))
+        filter_box.pack(side="left")
+        filter_box.bind("<<ComboboxSelected>>", lambda _e: self._apply_filters())
+        self.search_var.trace_add("write", lambda *_: self._apply_filters())
+
+        table_frame = tk.Frame(self.root, bg="#0d1117")
+        table_frame.pack(fill="both", expand=True, padx=14, pady=5)
+        columns = ("verdict", "protocol", "name", "pid", "state", "remote", "local", "path")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         headings = {
-            "verdict": "التقييم السلوكي (القرار الصريح)",
-            "name": "اسم البرنامج",
+            "verdict": "نتيجة الفحص الأولي",
+            "protocol": "البروتوكول",
+            "name": "العملية",
             "pid": "PID",
             "state": "الحالة",
-            "remote": "Remote IP:Port",
-            "local": "Local IP:Port",
-            "path": "مسار الملف التنفيذي",
+            "remote": "عنوان الوجهة",
+            "local": "العنوان المحلي",
+            "path": "مسار الملف",
         }
-        widths = {"verdict": 310, "name": 130, "pid": 65, "state": 95, "remote": 170, "local": 170, "path": 320}
+        widths = {"verdict": 300, "protocol": 78, "name": 130, "pid": 65, "state": 95, "remote": 175, "local": 175, "path": 360}
         for col in columns:
             self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], anchor="w")
-            
-        self.tree.tag_configure("danger", background="#4a0404", foreground="#fca5a5")
-        self.tree.tag_configure("warning", background="#3d2b00", foreground="#fde68a")
-        self.tree.tag_configure("local", background="#0b253a", foreground="#93c5fd")
-        self.tree.pack(fill="both", expand=True, padx=14, pady=6)
+            self.tree.column(col, width=widths[col], minwidth=65, anchor="w", stretch=(col == "path"))
+        self.tree.tag_configure("danger", background="#451a1a", foreground="#fecaca")
+        self.tree.tag_configure("warning", background="#3f2e12", foreground="#fde68a")
+        self.tree.tag_configure("uncertain", background="#172554", foreground="#bfdbfe")
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.bind("<<TreeviewSelect>>", self.show_selection)
 
-        details_frame = tk.Frame(self.root, bg="#0d1117", padx=14, pady=4)
+        details_frame = tk.Frame(self.root, bg="#0d1117", padx=14, pady=5)
         details_frame.pack(fill="x")
-        tk.Label(details_frame, text="📋 تحليل ومؤشرات الخطر للعملية المحددة:", bg="#0d1117", fg="#FFD700", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        self.details = tk.Text(details_frame, height=4, wrap="word", bg="#161b22", fg="#c9d1d9", insertbackground="#FFD700", relief="flat", font=("Consolas", 9))
-        self.details.pack(fill="x", pady=(4, 5))
-        self.details.insert("1.0", "اختر اتصالاً لعرض دوافع التقييم السلوكي وسطر الأوامر ومسار التشغيل الكامل.")
+        tk.Label(details_frame, text="تفاصيل الاتصال المحدد", bg="#0d1117", fg="#93c5fd", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.details = tk.Text(details_frame, height=5, wrap="word", bg="#111827", fg="#e5e7eb", insertbackground="#93c5fd", relief="flat", font=("Consolas", 9))
+        self.details.pack(fill="x", pady=(5, 6))
+        self.details.insert("1.0", "اختر اتصالاً من الجدول لعرض اسم العملية ومسارها ومؤشرات الاشتباه.")
         self.details.configure(state="disabled")
 
-        footer = tk.Frame(self.root, bg="#0d1117", padx=14, pady=6)
+        footer = tk.Frame(self.root, bg="#0b1220", padx=14, pady=8)
         footer.pack(fill="x")
-        tk.Label(footer, textvariable=self.status_var, bg="#0d1117", fg="#58a6ff", font=("Segoe UI", 9), anchor="w").pack(side="left", fill="x", expand=True)
-        tk.Label(footer, text="Behavioral Analysis Matrix Ready", bg="#0d1117", fg="#8b949e", font=("Segoe UI", 9)).pack(side="right")
+        tk.Label(footer, textvariable=self.status_var, bg="#0b1220", fg="#93c5fd", font=("Segoe UI", 9), anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Label(footer, text="Behavioral triage only • not a clean-file certificate", bg="#0b1220", fg="#94a3b8", font=("Segoe UI", 8)).pack(side="right")
+
+    def _summary_card(self, parent, title, value_var, accent):
+        card = tk.Frame(parent, bg="#161b22", padx=14, pady=9, highlightbackground="#30363d", highlightthickness=1)
+        tk.Label(card, text=title, bg="#161b22", fg="#9ca3af", font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(card, textvariable=value_var, bg="#161b22", fg=accent, font=("Segoe UI", 21, "bold")).pack(anchor="w")
+        return card
 
     def _button(self, parent, text, command, color="#21262d", fg="white"):
         return tk.Button(
@@ -387,15 +493,87 @@ class RATGuardApp:
         if self.worker_busy:
             return
         self.worker_busy = True
+        auto_block_enabled = self.auto_block_suspicious.get()
         self.status_var.set("⏳ جاري تحليل شبكة النظام وسلوك العمليات...")
 
         def work():
             try:
                 data = collect_connections()
-                self.events.put(("refresh_ok", data))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
+                return
+
+            blocked_count = 0
+            auto_block_error = ""
+            if auto_block_enabled:
+                try:
+                    blocked_count = self._auto_block_suspicious(data)
+                except Exception as exc:
+                    auto_block_error = str(exc)
+            for key, row in suspicious_outbound_candidates(data):
+                if key in self.auto_blocked_endpoints:
+                    row["auto_blocked"] = True
+            self.events.put(("refresh_ok", (data, blocked_count, auto_block_error)))
         threading.Thread(target=work, daemon=True).start()
+
+    def _toggle_auto_block(self):
+        if not self.auto_block_suspicious.get():
+            self.status_var.set("الحظر التلقائي متوقف.")
+            return
+        confirmed = messagebox.askyesno(
+            APP_NAME,
+            "سيُنشئ البرنامج قواعد Windows Firewall للاتصالات الصادرة عالية الاشتباه "
+            "(درجة 70 فأكثر) إلى عناوين IP عامة، ويقيّدها بالبروتوكول والمنفذ المرصود.\n\n"
+            "الفحص كل 8 ثوانٍ عند تفعيل التحديث التلقائي، أو عند التحديث اليدوي؛ "
+            "لذلك قد لا يمنع أول محاولة. "
+            "لا يقرأ البرنامج اسم النطاق؛ الحظر يكون على IP وقد يؤثر في نطاقات أخرى "
+            "تشاركه. هل تريد تفعيل ذلك؟",
+        )
+        if not confirmed:
+            self.auto_block_suspicious.set(False)
+            return
+        self.status_var.set("الحظر التلقائي للاتصالات عالية الاشتباه مفعّل.")
+        self.refresh()
+
+    def _auto_block_suspicious(self, rows):
+        candidates = [
+            (key, row)
+            for key, row in suspicious_outbound_candidates(rows)
+            if key not in self.auto_blocked_endpoints
+        ]
+        if not candidates:
+            return 0
+
+        entries = []
+        for (protocol, remote_ip, remote_port), _row in candidates:
+            digest = hashlib.sha256(
+                f"{protocol}:{remote_ip}:{remote_port}".encode()
+            ).hexdigest()[:12]
+            name = self._ps_quote(f"{RULE_PREFIX}AutoEndpoint-{digest}")
+            address = self._ps_quote(remote_ip)
+            entries.append(
+                f"@{{Name={name}; Address={address}; Port={remote_port}; Protocol='{protocol}'}}"
+            )
+        script = (
+            f"$items = @({';'.join(entries)}); "
+            "foreach ($item in $items) { "
+            "$n=$item.Name; "
+            "Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue | "
+            "Remove-NetFirewallRule -ErrorAction Stop; "
+            "New-NetFirewallRule -DisplayName $n -Direction Outbound -Action Block "
+            "-Protocol $item.Protocol -RemoteAddress $item.Address -RemotePort $item.Port "
+            "-Profile Any -Enabled True -ErrorAction Stop | Out-Null "
+            "}; Write-Output 'RATGUARD_OK'"
+        )
+        result = run_powershell(script, timeout=35)
+        if result.returncode != 0 or "RATGUARD_OK" not in result.stdout:
+            detail = (result.stderr or result.stdout or "فشل تنفيذ قواعد الحظر.").strip()
+            raise RuntimeError(detail)
+
+        for key, row in candidates:
+            self.auto_blocked_endpoints.add(key)
+            row["auto_blocked"] = True
+        return len(candidates)
 
     def _auto_tick(self):
         if self.auto_refresh.get():
@@ -408,8 +586,14 @@ class RATGuardApp:
                 kind, payload = self.events.get_nowait()
                 if kind == "refresh_ok":
                     self.worker_busy = False
-                    self._fill_table(payload)
-                    self.status_var.set(f"✅ آخر تحليل: {datetime.now().strftime('%H:%M:%S')} — تم فحص {len(payload)} اتصال تكتيكي.")
+                    rows, blocked_count, auto_block_error = payload
+                    self._fill_table(rows)
+                    status = f"✅ آخر تحليل: {datetime.now().strftime('%H:%M:%S')} — تم فحص {len(rows)} اتصال."
+                    if blocked_count:
+                        status += f" — أُنشئت قواعد حظر تلقائية لـ {blocked_count} وجهة عالية الاشتباه."
+                    self.status_var.set(status)
+                    if auto_block_error:
+                        self.events.put(("warning", f"تعذّر الحظر التلقائي: {auto_block_error}"))
                 elif kind == "error":
                     self.worker_busy = False
                     self.status_var.set("❌ حدث خطأ أثناء التحليل")
@@ -418,36 +602,83 @@ class RATGuardApp:
                     messagebox.showinfo(APP_NAME, payload)
                 elif kind == "warning":
                     messagebox.showwarning(APP_NAME, payload)
+                elif kind == "defender_status":
+                    messagebox.showinfo(APP_NAME, payload)
         except queue.Empty:
             pass
         self.root.after(250, self._process_events)
 
     def _fill_table(self, rows):
+        self.all_rows = list(rows)
+        danger = sum(1 for row in rows if row.get("level") == "danger")
+        warning = sum(1 for row in rows if row.get("level") == "warning")
+        unknown = len(rows) - danger - warning
+        self.summary_vars["total"].set(str(len(rows)))
+        self.summary_vars["danger"].set(str(danger))
+        self.summary_vars["warning"].set(str(warning))
+        self.summary_vars["unknown"].set(str(unknown))
+        self._apply_filters()
+
+    def _apply_filters(self):
+        if not hasattr(self, "tree"):
+            return
+        query = self.search_var.get().strip().lower()
+        selected_filter = self.filter_var.get()
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.rows_by_id.clear()
-        for row in rows:
-            tags = ()
-            v = row["verdict"]
-            if "🚨" in v:
-                tags = ("danger",)
-            elif "⚠️" in v:
-                tags = ("warning",)
-            elif "🟢" in v:
-                tags = ("local",)
-            iid = self.tree.insert("", "end", values=(row["verdict"], row["name"], row["pid"], row["state"], row["remote"], row["local"], row["path"]), tags=tags)
+
+        for row in self.all_rows:
+            level = row.get("level", "uncertain")
+            if selected_filter == "اشتباه مرتفع" and level != "danger":
+                continue
+            if selected_filter == "يحتاج تحقق" and level != "warning":
+                continue
+            if selected_filter == "غير محسوم" and level != "uncertain":
+                continue
+            searchable = " ".join(str(row.get(k, "")) for k in ("name", "pid", "remote", "local", "path", "command", "reasons", "protocol")).lower()
+            if query and query not in searchable:
+                continue
+            iid = self.tree.insert(
+                "", "end",
+                values=(row["verdict"], row.get("protocol", "TCP"), row["name"], row["pid"], row["state"], row["remote"], row["local"], row["path"]),
+                tags=(level,)
+            )
             self.rows_by_id[iid] = row
+
+    def export_csv(self):
+        if not self.all_rows:
+            messagebox.showinfo(APP_NAME, "لا توجد اتصالات لتصديرها.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="حفظ تقرير الاتصالات", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")], initialfile="RATGuard_connections.csv"
+        )
+        if not path:
+            return
+        fields = ("protocol", "name", "pid", "state", "local", "remote", "score", "level", "verdict", "reasons", "path", "command", "auto_blocked")
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(self.all_rows)
+            messagebox.showinfo(APP_NAME, f"تم حفظ التقرير:\n{path}")
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"تعذّر حفظ التقرير:\n{exc}")
 
     def show_selection(self, _event=None):
         row = self._selected_silent()
         if not row:
             return
         text = (
-            f"البرنامج: {row['name']}    |    PID: {row['pid']}    |    درجة الخطر: {row['score']}/100\n"
+            f"النتيجة: {row['verdict']}    |    المؤشر: {row['score']}/100    |    المستوى: {row.get('level', 'uncertain')}\n"
+            f"البرنامج: {row['name']}    |    PID: {row['pid']}    |    البروتوكول: {row.get('protocol', 'TCP')} / {row['state']}\n"
             f"مؤشرات الشبهة: {row['reasons']}\n"
-            f"الاتصال البعيد: {row['remote']}    |    المحلي: {row['local']}\n"
-            f"المسار: {row['path'] or '(غير متاح - ارفع الصلاحيات)'}\n"
-            f"الأمر التنفيذي: {row['command'] or '(غير متاح)'}"
+            f"الوجهة: {row['remote']}    |    المحلي: {row['local']}\n"
+            f"الحظر التلقائي: {'نعم' if row.get('auto_blocked') else 'لا'}\n"
+            f"المسار: {row['path'] or '(غير متاح)'}\n"
+            f"سطر الأوامر: {row['command'] or '(غير متاح)'}\n"
+            "مهم: النتيجة غير المحسومة لا تعني أن الملف آمن؛ استخدم Defender وفحص الملف."
         )
         self.details.configure(state="normal")
         self.details.delete("1.0", "end")
@@ -502,19 +733,22 @@ class RATGuardApp:
         try:
             ip_text = self._safe_remote_ip(row["remote_ip"])
             port = int(row["remote_port"])
+            protocol = row.get("protocol", "TCP").upper()
+            if not 1 <= port <= 65535:
+                raise ValueError("المنفذ البعيد غير صالح أو غير محدد؛ استخدم حظر IP اليدوي إذا لزم الأمر.")
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc) or "عنوان IP أو المنفذ غير صالح.")
             return
-        rule = f"{RULE_PREFIX}Endpoint-{hashlib.sha256(f'{ip_text}:{port}'.encode()).hexdigest()[:12]}"
-        if not messagebox.askyesno(APP_NAME, f"حظر الاتصالات الصادرة إلى {ip_text}:{port}؟"):
+        rule = f"{RULE_PREFIX}Endpoint-{hashlib.sha256(f'{protocol}:{ip_text}:{port}'.encode()).hexdigest()[:12]}"
+        if not messagebox.askyesno(APP_NAME, f"حظر الاتصالات الصادرة إلى {ip_text}:{port} ({protocol})؟"):
             return
         qrule, qip = self._ps_quote(rule), self._ps_quote(ip_text)
         script = (
             f"$n={qrule}; Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
-            f"New-NetFirewallRule -DisplayName $n -Direction Outbound -Action Block -Protocol TCP -RemoteAddress {qip} -RemotePort {port} -Profile Any -Enabled True -ErrorAction Stop | Out-Null; "
+            f"New-NetFirewallRule -DisplayName $n -Direction Outbound -Action Block -Protocol {protocol} -RemoteAddress {qip} -RemotePort {port} -Profile Any -Enabled True -ErrorAction Stop | Out-Null; "
             "Write-Output 'RATGUARD_OK'"
         )
-        self._firewall_job(script, f"✅ تم حظر الاتصال إلى {ip_text}:{port} بنجاح.")
+        self._firewall_job(script, f"تم إنشاء قاعدة حظر للاتصال إلى {ip_text}:{port} ({protocol}).")
 
     def block_selected_program(self):
         row = self._selected()
@@ -590,6 +824,7 @@ class RATGuardApp:
             "Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
             "Write-Output 'RATGUARD_OK'"
         )
+        self.auto_blocked_endpoints.clear()
         self._firewall_job(script, "🧹 تم مسح جميع القواعد المخصصة بنجاح.")
 
     def scan_file(self):
@@ -607,9 +842,41 @@ class RATGuardApp:
         def work():
             result = run_powershell(f"Start-MpScan -ScanType CustomScan -ScanPath '{safe_path}' -ErrorAction Stop; Write-Output 'DEFENDER_OK'", timeout=90)
             if result.returncode == 0:
-                self.events.put(("message", "✅ تم إرسال الطلب بنجاح إلى Defender."))
+                self.events.put(("message", "تم تنفيذ طلب الفحص بواسطة Defender. راجع سجل الحماية في Windows Security لمعرفة نتيجة الكشف؛ بدء الفحص لا يعني أن الملف نظيف."))
             else:
-                self.events.put(("warning", "⚠️ تعذّر تشغيل الفحص بـ Defender."))
+                self.events.put(("warning", "تعذّر تشغيل الفحص بـ Defender. تحقق من أن الحماية مفعّلة وأن خدمة Defender تعمل."))
+        threading.Thread(target=work, daemon=True).start()
+
+    def check_defender_status(self):
+        self.status_var.set("جاري التحقق من Microsoft Defender...")
+        def work():
+            ps = (
+                "try { $s=Get-MpComputerStatus -ErrorAction Stop; "
+                "[PSCustomObject]@{AMServiceEnabled=$s.AMServiceEnabled; AntivirusEnabled=$s.AntivirusEnabled; "
+                "RealTimeProtectionEnabled=$s.RealTimeProtectionEnabled; SignatureAge=$s.AntivirusSignatureAge; "
+                "LastUpdated=$s.AntivirusSignatureLastUpdated} | ConvertTo-Json -Compress } "
+                "catch { Write-Error $_; exit 1 }"
+            )
+            result = run_powershell(ps, timeout=25)
+            if result.returncode != 0 or not result.stdout.strip():
+                self.events.put(("warning", "تعذّر قراءة حالة Defender. تأكد أن Microsoft Defender متاح وغير معطّل بواسطة سياسة النظام."))
+                return
+            try:
+                data = json.loads(result.stdout.strip())
+                realtime = bool(data.get("RealTimeProtectionEnabled"))
+                antivirus = bool(data.get("AntivirusEnabled"))
+                service = bool(data.get("AMServiceEnabled"))
+                verdict = "مفعّل" if realtime and antivirus and service else "معطّل أو غير مكتمل"
+                report = (
+                    f"حالة Microsoft Defender: {verdict}\\n\\n"
+                    f"خدمة الحماية: {service}\\nمضاد الفيروسات: {antivirus}\\n"
+                    f"الحماية الفورية: {realtime}\\nعمر التواقيع بالأيام: {data.get('SignatureAge', 'غير معروف')}\\n"
+                    f"آخر تحديث: {data.get('LastUpdated', 'غير معروف')}\\n\\n"
+                    "تنبيه: تعطيل الحماية يجعل نتائج Defender غير مفيدة كدليل على سلامة الملف."
+                )
+                self.events.put(("defender_status", report))
+            except Exception as exc:
+                self.events.put(("warning", f"تعذّر تحليل نتيجة Defender: {exc}"))
         threading.Thread(target=work, daemon=True).start()
 
     def check_selected_file(self):
